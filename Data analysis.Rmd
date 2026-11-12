@@ -1,0 +1,962 @@
+---
+title: " R analysis (final)"
+author: "VGG"
+date: "2025-07-25"
+output: html_document
+---
+
+```{r setup,include=FALSE}
+library(tidyverse)
+library(lme4)
+library(dplyr)
+library(car)
+library(performance)
+library(readxl)
+library(stringr)
+library(lmtest)
+library(nortest)
+library(effects)
+library(ggplot2)
+library(reshape2)
+library(ggcorrplot)
+library(patchwork)
+library(gt)
+library(gridExtra)
+library(sjPlot)
+library(broom)
+library(parameters)
+library(modelsummary)
+```
+
+```{r loading data}
+#request access and load data from TEBC(https://reproductive-health.ed.ac.uk/theirworld-edinburgh-birth-cohort-tebc)
+child_TC <- read.csv("Z:/R analysis/raw_data/timecourses/children_TC/child_TC_FFA_MMPFC_TR1_clean.csv")
+adult_TC <- read.csv("Z:/R analysis/raw_data/timecourses/adult_TC/average/adult_TC_FFA_MMPFC_TR1_clean.csv")
+participant_data<- read_excel("Z:/Varunavi Gnana Ganesh/Data analysis/demographics_synchrony_meanfd.xlsx")
+demographics <- read.csv("Z:/R analysis/raw_data/demographics/FRICS_demographics.csv")
+motion <- read_tsv("Z:/R analysis/raw_data/motion/outlier_info.tsv")
+```
+
+```{r Data exploration, echo=FALSE}
+head(child_TC)
+colnames(child_TC)
+head(adult_TC)
+colnames(adult_TC)
+summary(participant_data)
+summary(adult_TC)
+summary(child_TC)
+```
+
+```{r Splitting the data}
+first_half <- 0:157
+second_half <- 166:323
+```
+
+```{r Finding functional maturity}
+#creating a function to calculate fm values based on adult TC for each half by correlation 
+calc_fm <- function(child_df, adult_df, roi_col) {
+  fm_values <- child_df |>
+    group_by(Sub) |>
+    nest() |>
+    mutate(
+      fm_raw = map_dbl(data, function(df) {
+        child_first <- df |> filter(time %in% first_half) |> pull({{ roi_col }})
+        child_second <- df |> filter(time %in% second_half) |> pull({{ roi_col }})
+        adult_first <- adult_df |> filter(time %in% first_half) |> pull({{ roi_col }})
+        adult_second <- adult_df |> filter(time %in% second_half) |> pull({{ roi_col }})
+        
+        r1 <- cor(child_first, adult_first, use = "complete.obs")
+        r2 <- cor(child_second, adult_second, use = "complete.obs")
+        
+        mean(c(r1,r2), na.rm = TRUE)  # calculating mean first
+      })
+    ) |>
+    select(Sub, fm_raw) |>
+  ungroup()
+
+#manual z-scoring 
+   mean_r12 <- mean(fm_values$fm_raw, na.rm = TRUE)
+  sd_r12 <- sd(fm_values$fm_raw, na.rm = TRUE) 
+   fm_final <- fm_values |>
+  mutate(fm_z = (fm_raw - mean_r12)/sd_r12) |>
+  select(Sub, fm_z) 
+  
+ return(fm_final)
+}
+
+# Apply FM function to rFFA and lFFA
+fm_rFFA <- calc_fm(child_TC, adult_TC, roi_col = rFFA) |> rename(Fm_rFFA = fm_z)
+fm_lFFA <- calc_fm(child_TC, adult_TC, roi_col = lFFA) |> rename(Fm_lFFA = fm_z)
+```
+
+```{r Finding functional connectivity}
+#Creating a fucntion to calculate functional connectivity 
+calc_fx <- function(child_df, roi1, roi2, fc_name) {
+  fx_values <- child_df |>
+    group_by(Sub) |>
+    nest() |>
+    mutate(
+      fx_raw = map_dbl(data, function(df) {
+        seg1 <- df |> filter(time %in% first_half)
+        seg2 <- df |> filter(time %in% second_half)
+        
+        r3 <- cor(seg1[[roi1]], seg1[[roi2]], use = "complete.obs")
+        r4 <- cor(seg2[[roi1]], seg2[[roi2]], use = "complete.obs")
+        
+        mean(c(r3, r4), na.rm = TRUE) #mean
+      }),
+    ) |>
+    select(Sub, fx_raw) |>
+    ungroup ()
+   
+    #Manual z-scoring 
+    mean_r34 <- mean(fx_values$fx_raw, na.rm = TRUE)
+    sd_r34 <- sd(fx_values$fx_raw, na.rm = TRUE)
+  
+    fx_final <- fx_values |>
+    mutate(!!fc_name := (fx_raw - mean_r34) / sd_r34) |>
+    select(Sub, all_of(fc_name))
+  
+    return(fx_final)
+}
+
+# Applying the FX function to all four ROIs 
+fx_rFFA_rMMPFC <- calc_fx(child_TC, "rFFA", "rMMPFC", "Fx_rFFA_rMMPFC")
+fx_rFFA_lMMPFC <- calc_fx(child_TC, "rFFA", "lMMPFC", "Fx_rFFA_lMMPFC")
+fx_lFFA_rMMPFC <- calc_fx(child_TC, "lFFA", "rMMPFC", "Fx_lFFA_rMMPFC")
+fx_lFFA_lMMPFC <- calc_fx(child_TC, "lFFA", "lMMPFC", "Fx_lFFA_lMMPFC")
+```
+
+```{r Merging all data }
+#creating a master dataset with all values based on sub
+full_data <- participant_data |>
+  left_join(fm_rFFA, by = "Sub") |>
+  left_join(fm_lFFA, by = "Sub") |>
+  left_join(fx_rFFA_rMMPFC, by = "Sub") |>
+  left_join(fx_rFFA_lMMPFC, by = "Sub") |>
+  left_join(fx_lFFA_rMMPFC, by = "Sub") |>
+  left_join(fx_lFFA_lMMPFC, by = "Sub")
+
+#saving it somewhere 
+write_csv(full_data, "Z:/Varunavi Gnana Ganesh/Data analysis/final_data.csv") 
+```
+
+```{r Exploraing dataset}
+str(full_data)
+summary(full_data)
+#note: all NAs values removed 
+#this means even if either mean_FD or sync% was NA, participant is excluded from final analysis
+
+#create a summary table
+full_data_summary_stats <- full_data %>%
+  select(-Sub, -sex) %>%
+  map_df(~ {
+    mn <- min(.x, na.rm = TRUE)
+    mx <- max(.x, na.rm = TRUE)
+    tibble(
+      Mean = round(mean(.x, na.rm = TRUE), 2),
+      SD = round(sd(.x, na.rm = TRUE), 2),
+      Range = paste0("(", round(mn, 2), ", ", round(mx, 2), ")")
+    )
+  }, .id = "Variable")
+
+print(full_data_summary_stats)
+```
+
+```{r Wide data}
+# Creating a new dataframe with scaled variables
+wide_data <- full_data |> 
+  mutate(
+    GA = scale(GA)[, 1],
+    testing_age_days = scale(testing_age_days)[, 1],
+    synchrony = scale(synchrony)[, 1],
+    mean_FD = scale(mean_FD)[, 1]
+  )
+```
+
+
+```{r Long data}
+# Reshape wide to long format for FX values for rFFA
+long_data_rFFA <- wide_data |>
+  select(Sub, Fm_rFFA, Fx_rFFA_rMMPFC, Fx_rFFA_lMMPFC,
+         synchrony, GA, testing_age_days, mean_FD) |>
+  pivot_longer(
+    cols = starts_with("Fx_rFFA"),
+    names_to = "Connection",
+    values_to = "Fx_rFFA_rlMMPFC"
+  ) |>
+  mutate(
+    Hemisphere = case_when(
+      str_detect(Connection, "rMMPFC") ~ "Right",
+      str_detect(Connection, "lMMPFC") ~ "Left"
+    )
+  )
+
+# Reshape wide to long format for FX values for lFFA
+long_data_lFFA <- wide_data |>
+  select(Sub, Fm_lFFA, Fx_lFFA_rMMPFC, Fx_lFFA_lMMPFC,
+         synchrony, GA, testing_age_days, mean_FD) |>
+  pivot_longer(
+    cols = starts_with("Fx_lFFA"),
+    names_to = "Connection",
+    values_to = "Fx_lFFA_rlMMPFC"
+  ) |>
+  mutate(
+    Hemisphere = case_when(
+      str_detect(Connection, "rMMPFC") ~ "Right",
+      str_detect(Connection, "lMMPFC") ~ "Left"
+    )
+  )
+```
+
+```{r Data Summary}
+summary(long_data_rFFA)
+str(long_data_rFFA)
+summary(long_data_lFFA)
+str(long_data_lFFA)
+```
+
+```{r Model 1-4 : lmer}
+#for rFFA
+model1_rFFA <- lmer(
+  Fm_rFFA ~ Fx_rFFA_rlMMPFC*Hemisphere*synchrony + testing_age_days + GA + mean_FD + (1| Sub),
+  data = long_data_rFFA)
+# model shows convergence issues - decided to remove interaction terms
+model2_rFFA <- lmer(
+  Fm_rFFA ~ Fx_rFFA_rlMMPFC*Hemisphere + synchrony + testing_age_days + GA + mean_FD + (1| Sub),
+  data = long_data_rFFA)
+# model shows convergence issues - decided to remove interaction terms
+model3_rFFA <- lmer(
+  Fm_rFFA ~ Fx_rFFA_rlMMPFC*synchrony + Hemisphere + testing_age_days + GA + mean_FD + (1| Sub),
+  data = long_data_rFFA)
+# model shows convergence issues - decided to remove all interaction terms
+model4_rFFA <- lmer(
+  Fm_rFFA ~ Fx_rFFA_rlMMPFC + Hemisphere + synchrony + testing_age_days + GA + mean_FD + (1| Sub),
+  data = long_data_rFFA)
+# model shows convergence issues - decided to run lm instead 
+
+#for lFFA
+model1_lFFA <- lmer(
+  Fm_lFFA ~ Fx_lFFA_rlMMPFC*Hemisphere*synchrony + testing_age_days + GA + mean_FD + (1| Sub),
+  data = long_data_lFFA)
+# model shows convergence issues - decided to remove interaction terms
+model2_lFFA <- lmer(
+  Fm_lFFA ~ Fx_lFFA_rlMMPFC*Hemisphere + synchrony + testing_age_days + GA + mean_FD + (1| Sub),
+  data = long_data_lFFA)
+# model shows convergence issues - decided to remove interaction terms
+model3_lFFA <- lmer(
+  Fm_lFFA ~ Fx_lFFA_rlMMPFC*synchrony + Hemisphere + testing_age_days + GA + mean_FD + (1| Sub),
+  data = long_data_lFFA)
+# model shows convergence issues - decided to remove all interaction terms
+model4_lFFA <- lmer(
+  Fm_lFFA ~ Fx_lFFA_rlMMPFC + Hemisphere + synchrony + testing_age_days + GA + mean_FD + (1| Sub),
+  data = long_data_lFFA)
+# model shows convergence issues - decided to run lm instead 
+```
+
+```{r Model 5 & 6 : lm}
+#for rFFA 
+model5_rFFA <- lm(
+  Fm_rFFA ~ Fx_rFFA_rMMPFC*synchrony + Fx_rFFA_lMMPFC*synchrony + GA + testing_age_days + mean_FD, 
+  data = wide_data)
+summary(model5_rFFA) #no predictors are significant - running it without interactions 
+
+model6_rFFA <- lm(
+  Fm_rFFA ~ Fx_rFFA_rMMPFC + Fx_rFFA_lMMPFC + synchrony + GA + testing_age_days + mean_FD, 
+  data = wide_data)
+summary(model6_rFFA) #no predictors are significant 
+
+anova(model6_rFFA, model5_rFFA) #checking if dropping interaction is okay - yes! (no need to report)
+
+#for lFFA 
+model5_lFFA <- lm(
+  Fm_lFFA ~ Fx_lFFA_rMMPFC*synchrony + Fx_lFFA_lMMPFC*synchrony+ GA + testing_age_days + mean_FD, 
+  data = wide_data)
+summary(model5_lFFA) #no predictors are significant (except for mean_FD) - running it without interactions 
+
+model6_lFFA <- lm(
+  Fm_lFFA ~ Fx_lFFA_rMMPFC + Fx_lFFA_lMMPFC + synchrony + GA + testing_age_days + mean_FD, 
+  data = wide_data)
+summary(model6_lFFA) #no predictors are significant (except for mean_FD)
+
+anova(model6_lFFA, model5_lFFA) #checking if dropping interaction is okay - yes! (no need to report)
+
+
+```
+
+```{r Model Assumptions}
+
+# Normality test
+shapiro.test(residuals(model6_rFFA)) #both show non-normality (very mild)
+shapiro.test(residuals(model6_lFFA))
+
+# Homoscedasticity test
+bptest(model6_rFFA) #rFFA has heteroscedasticity 
+bptest(model6_lFFA)
+
+# Linearity test (RESET)
+resettest(model6_rFFA) #assumptions met 
+resettest(model6_lFFA)
+
+# Independence test
+dwtest(model6_rFFA) #rFFA violate independence assumption (boderline) 
+dwtest(model6_lFFA)
+
+#plotting assumptions 
+par(mfrow = c(2, 2))
+plot(model6_rFFA)
+plot(model6_lFFA)
+#shows some non-linear trends
+
+#checking for multicollinearity  
+vif(model6_rFFA) #no multicollinearity
+vif(model6_lFFA) 
+```
+
+```{r mean_FD outliers - not included} 
+
+#mean and SD of mean_FD
+fd_mean <- mean(wide_data$mean_FD, na.rm = TRUE)
+fd_sd <- sd(wide_data$mean_FD, na.rm = TRUE)
+
+#plotting
+ggplot(wide_data, aes(x = Sub, y = mean_FD)) +
+  geom_point(color = "#1f78b4", size = 2) +
+  geom_hline(yintercept = fd_mean + 3 * fd_sd, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = fd_mean - 3 * fd_sd, linetype = "dashed", color = "red") +
+  labs(
+    title = "Scatter Plot of Mean FD by Subject",
+    x = "Subject",
+    y = "Mean FD"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, size = 7),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r Model Visualization - raw data w/ mean - not included} 
+
+#mean and sd of sync
+sync_mean <- mean(wide_data$synchrony, na.rm = TRUE)
+sync_sd <- sd(wide_data$synchrony, na.rm = TRUE)
+
+#creating a new data frame 
+plot_data <- wide_data |>
+  mutate(sync_group = cut(
+    synchrony,
+    breaks = c(-Inf, mean(synchrony, na.rm = TRUE) - sd(synchrony, na.rm = TRUE),
+                    mean(synchrony, na.rm = TRUE) + sd(synchrony, na.rm = TRUE), Inf),
+    labels = c("-1 SD", "Mean", "+1 SD")
+  ))
+
+#creating a function to make plots
+plot_sync<- function(data, fx_var, fm_var, xlab, ylab) {
+  ggplot(data, aes_string(x = fx_var, y = fm_var, color = "sync_group", fill = "sync_group")) +
+    geom_smooth(method = "lm", se = TRUE, alpha = 0.2) +
+    scale_color_manual(values = c("#1f77b4", "#666666", "#d62728")) +
+    scale_fill_manual(values = c("-1 SD" = "#1f77b4", "Mean" = "#666666", "+1 SD" = "#d62728")) +
+    labs(x = xlab, y = ylab, color = "Synchrony", fill = "Synchrony") +
+    theme_minimal()
+}
+
+#plotting 
+p1 <- plot_sync(plot_data, "Fx_rFFA_rMMPFC", "Fm_rFFA", "Fx rFFA–rMMPFC", "Fm rFFA")
+p2 <- plot_sync(plot_data, "Fx_rFFA_lMMPFC", "Fm_rFFA", "Fx rFFA–lMMPFC", "Fm rFFA")
+p3 <- plot_sync(plot_data, "Fx_lFFA_rMMPFC", "Fm_lFFA", "Fx lFFA–rMMPFC", "Fm lFFA")
+p4 <- plot_sync(plot_data, "Fx_lFFA_lMMPFC", "Fm_lFFA", "Fx lFFA–lMMPFC", "Fm lFFA")
+
+(p1 | p2) / (p3 | p4)
+```
+
+```{r Model visualization - raw data w/ quantiles}
+
+#Creating quantile-based synchrony groups in a new df
+plot_data <- wide_data |>
+  mutate(sync_tertile = cut(
+    synchrony,
+    breaks = quantile(synchrony, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+    labels = c("Low", "Medium", "High"),
+    include.lowest = TRUE
+  ))
+
+#function to make tertile plot 
+plot_sync_tertile <- function(data, fx_var, fm_var, xlab, ylab) {
+  ggplot(data, aes_string(x = fx_var, y = fm_var, color = "sync_tertile", fill = "sync_tertile", linetype = "sync_tertile")) +
+    geom_smooth(method = "lm", se = TRUE, alpha = 0.2) +
+    scale_color_manual(values = c("Low" = "#1f77b4", "Medium" = "#666666", "High" = "#d62728")) +
+    scale_fill_manual(values = c("Low" = "#1f77b4", "Medium" = "#666666", "High" = "#d62728")) +
+    scale_linetype_manual(values = c("Low" = "dotted", "Medium" = "dashed", "High" = "solid")) +
+    labs(x = xlab, y = ylab, color = "Synchrony", fill = "Synchrony", linetype = "Synchrony") +
+    theme_minimal()
+}
+
+#plotting 
+q1 <- plot_sync_tertile(plot_data, "Fx_rFFA_rMMPFC", "Fm_rFFA", "Fx rFFA–rMMPFC", "Fm rFFA")
+q2 <- plot_sync_tertile(plot_data, "Fx_rFFA_lMMPFC", "Fm_rFFA", "Fx rFFA–lMMPFC", "Fm rFFA")
+q3 <- plot_sync_tertile(plot_data, "Fx_lFFA_rMMPFC", "Fm_lFFA", "Fx lFFA–rMMPFC", "Fm lFFA")
+q4 <- plot_sync_tertile(plot_data, "Fx_lFFA_lMMPFC", "Fm_lFFA", "Fx lFFA–lMMPFC", "Fm lFFA")
+
+# Combine plots with a shared legend
+combined_plot <- (q1 + q2 + q3 + q4) +
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "right")
+
+# Display
+combined_plot
+
+```
+
+```{r Model visualization - w/ Beta co-eff}
+
+#beta co-eff from models 
+coefs_rFFA <- summary(model6_rFFA)$coefficients
+coefs_lFFA <- summary(model6_lFFA)$coefficients
+
+#rFFA betas and p-values
+beta_r_rFFA <- round(coefs_rFFA["Fx_rFFA_rMMPFC", "Estimate"], 2)
+p_r_rFFA <- coefs_rFFA["Fx_rFFA_rMMPFC", "Pr(>|t|)"]
+beta_l_rFFA <- round(coefs_rFFA["Fx_rFFA_lMMPFC", "Estimate"], 2)
+p_l_rFFA <- coefs_rFFA["Fx_rFFA_lMMPFC", "Pr(>|t|)"]
+
+#lFFA betas and p-values
+beta_r_lFFA <- round(coefs_lFFA["Fx_lFFA_rMMPFC", "Estimate"], 2)
+p_r_lFFA <- coefs_lFFA["Fx_lFFA_rMMPFC", "Pr(>|t|)"]
+beta_l_lFFA <- round(coefs_lFFA["Fx_lFFA_lMMPFC", "Estimate"], 2)
+p_l_lFFA <- coefs_lFFA["Fx_lFFA_lMMPFC", "Pr(>|t|)"]
+
+#creating a function to extract significance 
+stars <- function(p) {
+  if (p < 0.001) return("***")
+  else if (p < 0.01) return("**")
+  else if (p < 0.05) return("*")
+  else return("ns")
+}
+
+#Plot for rFFA - rMMPFC 
+p_rFFA_r <- ggplot(wide_data, aes(x = Fx_rFFA_rMMPFC, y = Fm_rFFA)) +
+  geom_point(color = "#d62728", alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "#d62728", size = 1.2) +
+  labs(x = "Fx rFFA-rMMPFC", y = "Fm rFFA") +
+  theme_minimal(base_size = 14) +
+  annotate("text", x = min(wide_data$Fx_rFFA_rMMPFC, na.rm=TRUE), 
+           y = max(wide_data$Fm_rFFA, na.rm=TRUE), 
+           label = paste0("β = ", beta_r_rFFA, stars(p_r_rFFA)), 
+           hjust = 0, vjust = 1, color = "black", size = 4)
+
+#Plot for rFFA - lMMPFC 
+p_rFFA_l <- ggplot(wide_data, aes(x = Fx_rFFA_lMMPFC, y = Fm_rFFA)) +
+  geom_point(color = "#1f77b4", alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "#1f77b4", size = 1.2) +
+  labs(x = "Fx rFFA-lMMPFC", y = NULL) +
+  theme_minimal(base_size = 14) +
+  annotate("text", x = min(wide_data$Fx_rFFA_lMMPFC, na.rm=TRUE), 
+           y = max(wide_data$Fm_rFFA, na.rm=TRUE), 
+           label = paste0("β = ", beta_l_rFFA, stars(p_l_rFFA)), 
+           hjust = 0, vjust = 1, color = "black", size = 4)
+
+#Plot for lFFA - rMMPFC 
+p_lFFA_r <- ggplot(wide_data, aes(x = Fx_lFFA_rMMPFC, y = Fm_lFFA)) +
+  geom_point(color = "#d62728", alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "#d62728", size = 1.2) +
+  labs(x = "Fx lFFA-rMMPFC", y = "Fm lFFA") +
+  theme_minimal(base_size = 14) +
+  annotate("text", x = min(wide_data$Fx_lFFA_rMMPFC, na.rm=TRUE), 
+           y = max(wide_data$Fm_lFFA, na.rm=TRUE), 
+           label = paste0("β = ", beta_r_lFFA, stars(p_r_lFFA)), 
+           hjust = 0, vjust = 1, color = "black", size = 4)
+
+#Plot for lFFA - lMMPFC 
+p_lFFA_l <- ggplot(wide_data, aes(x = Fx_lFFA_lMMPFC, y = Fm_lFFA)) +
+  geom_point(color = "#1f77b4", alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "#1f77b4", size = 1.2) +
+  labs(x = "Fx lFFA-lMMPFC", y = NULL) +
+  theme_minimal(base_size = 14) +
+  annotate("text", x = min(wide_data$Fx_lFFA_lMMPFC, na.rm=TRUE), 
+           y = max(wide_data$Fm_lFFA, na.rm=TRUE), 
+           label = paste0("β = ", beta_l_lFFA, stars(p_l_lFFA)), 
+           hjust = 0, vjust = 1, color = "black", size = 4)
+
+gridExtra::grid.arrange(
+  p_rFFA_r, p_rFFA_l,
+  p_lFFA_r, p_lFFA_l,
+  ncol = 2, nrow = 2
+)
+
+```
+
+```{r Model visualization - prediction (not indluded)}
+
+#synchrony levels and aesthetics
+sync_stats <- wide_data |> 
+  summarize(mean_sync = mean(synchrony, na.rm = TRUE),
+            sd_sync = sd(synchrony, na.rm = TRUE))
+
+sync_levels <- c(sync_stats$mean_sync - sync_stats$sd_sync,
+                 sync_stats$mean_sync,
+                 sync_stats$mean_sync + sync_stats$sd_sync)
+
+sync_labels <- c("-1 SD", "Mean", "+1 SD")
+line_types <- c("dotted", "solid", "dashed")
+colors <- c("blue","red", "grey")
+names(colors) <- sync_labels
+names(line_types) <- sync_labels
+
+#creating a function 
+make_plot_data <- function(model, focal_var, fixed_var, sync_levels, data) {
+  focal_range <- seq(min(data[[focal_var]], na.rm = TRUE),
+                     max(data[[focal_var]], na.rm = TRUE),
+                     length.out = 100)
+  
+  fixed_mean <- mean(data[[fixed_var]], na.rm = TRUE)
+
+  newdata <- expand.grid(
+    synchrony = sync_levels,
+    Fx_val = focal_range,
+    GA = mean(data$GA, na.rm = TRUE),
+    testing_age_days = mean(data$testing_age_days, na.rm = TRUE),
+    mean_FD = mean(data$mean_FD, na.rm = TRUE)
+  )
+
+  newdata[[focal_var]] <- newdata$Fx_val
+  newdata[[fixed_var]] <- fixed_mean
+  newdata$Fx_val <- NULL
+  
+  preds <- predict(model, newdata, interval = "confidence")
+  newdata <- cbind(newdata, preds)
+  newdata$sync_label <- factor(newdata$synchrony, levels = sync_levels, labels = sync_labels)
+  
+  return(newdata)
+}
+
+#rFFA plot data 
+plot_data_rMMPFC <- make_plot_data(model5_rFFA, "Fx_rFFA_rMMPFC", "Fx_rFFA_lMMPFC", sync_levels, wide_data)
+plot_data_lMMPFC <- make_plot_data(model5_rFFA, "Fx_rFFA_lMMPFC", "Fx_rFFA_rMMPFC", sync_levels, wide_data)
+
+#Plotting function
+plot_fx_interaction <- function(plot_data, xvar, xlab, ylab) {
+  ggplot(plot_data, aes_string(x = xvar, y = "fit", 
+                               color = "sync_label", fill = "sync_label", linetype = "sync_label")) +
+    geom_line(size = 1.2) +
+    geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, color = NA) +
+    scale_color_manual(values = colors) +
+    scale_fill_manual(values = colors) +
+    scale_linetype_manual(values = line_types) +
+    labs(x = xlab, y = ylab, color = "Synchrony", fill = "Synchrony", linetype = "Synchrony") +
+    theme_minimal() +
+    theme(legend.position = "right")
+}
+
+#plot rFFA 
+p_rMMPFC <- plot_fx_interaction(plot_data_rMMPFC, "Fx_rFFA_rMMPFC", "fx rFFA–rMMPFC", "fm rFFA")
+p_lMMPFC <- plot_fx_interaction(plot_data_lMMPFC, "Fx_rFFA_lMMPFC", "fx rFFA–lMMPFC", "fm rFFA")
+
+# Print the plots
+print(p_rMMPFC)
+print(p_lMMPFC)
+
+# plot for lFFA
+
+#lFFA plot data 
+plot_data_lFFA_rMMPFC <- make_plot_data(model5_lFFA, "Fx_lFFA_rMMPFC", "Fx_lFFA_lMMPFC", sync_levels, wide_data)
+plot_data_lFFA_lMMPFC <- make_plot_data(model5_lFFA, "Fx_lFFA_lMMPFC", "Fx_lFFA_rMMPFC", sync_levels, wide_data)
+
+# Generate and print the plots
+p_lFFA_rMMPFC <- plot_fx_interaction(plot_data_lFFA_rMMPFC, "Fx_lFFA_rMMPFC", "fx lFFA–rMMPFC", "fm lFFA")
+p_lFFA_lMMPFC <- plot_fx_interaction(plot_data_lFFA_lMMPFC, "Fx_lFFA_lMMPFC", "fx lFFA–lMMPFC", "fm lFFA")
+
+print(p_lFFA_rMMPFC)
+print(p_lFFA_lMMPFC)
+
+(p_rMMPFC | p_lMMPFC) / (p_lFFA_rMMPFC | p_lFFA_lMMPFC)
+```
+
+```{r fMRI visualization child vs adult}
+
+# Filter and average child TC
+child_TC_filtered <- child_TC |> 
+  filter(Sub %in% participant_data$Sub)
+
+child_TC_avg <- child_TC_filtered |> 
+  group_by(time) |>
+  summarise(
+    rFFA = mean(rFFA, na.rm = TRUE),
+    lFFA = mean(lFFA, na.rm = TRUE),
+    rMMPFC = mean(rMMPFC, na.rm = TRUE),
+    lMMPFC = mean(lMMPFC, na.rm = TRUE)
+  ) |> 
+  mutate(Group = "Child")
+
+#Adult TC
+adult_TC_avg <- adult_TC |> 
+  select(time, rFFA, lFFA, rMMPFC, lMMPFC) |> 
+  mutate(Group = "Adult")
+
+#Combine adult and child 
+combined_TC <- bind_rows(child_TC_avg, adult_TC_avg) |> 
+  pivot_longer(cols = -c(time, Group), names_to = "ROI", values_to = "BOLD")
+
+#for each TR
+all_times <- expand.grid(
+  time = 1:323,
+  ROI = c("rFFA", "lFFA", "rMMPFC", "lMMPFC"),
+  Group = c("Child", "Adult")
+) |> 
+  as_tibble()
+
+combined_TC_full <- all_times |> 
+  left_join(combined_TC, by = c("time", "ROI", "Group"))
+
+#Plotting
+ggplot(combined_TC_full, aes(x = time, y = BOLD, color = Group)) +
+  geom_line(size = 0.5, na.rm = FALSE) +
+  facet_wrap(~ ROI, scales = "free_y") +
+  labs(
+    #title = "Child vs. Adult BOLD Signals Across ROIs",
+    x = "Time (TR)",
+    y = "Response Magnitude",
+    color = "Group"
+  ) +
+  scale_color_manual(values = c("Child" = "#1f78b4", "Adult" = "#e31a1c")) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 10),
+    plot.title = element_text(size = 12, hjust = 0.5)
+  )
+```
+
+```{r Correlation heatmap - TC}
+
+#filter adult data
+adult_wide_filtered <- adult_TC |>
+  select(rFFA, lFFA, rMMPFC, lMMPFC)
+
+cor_adult <- cor(adult_wide_filtered, use = "pairwise.complete.obs")
+melted_adult <- melt(cor_adult)
+
+melted_adult <- melted_adult |>
+  mutate(
+    row_num = as.numeric(factor(Var1, levels = rownames(cor_adult))),
+    col_num = as.numeric(factor(Var2, levels = colnames(cor_adult)))
+  ) |>
+  filter(row_num >= col_num)  # keep only lower triangle + diagonal
+
+plot_adult <- ggplot(melted_adult, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 4) +
+  scale_fill_gradient2(low = "#1f78b4", mid = "white", high = "#e31a1c", midpoint = 0,
+                       limit = c(-1, 1), name = "Correlation") +
+  theme_minimal() +
+  labs(title = "Adult") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme(
+  plot.title = element_text(hjust = 0.5),
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  axis.text.x = element_text(angle = 45, hjust = 1),  # show ROI names on x
+  axis.text.y = element_text()                         # show ROI names on y
+  )
+
+#filter child data
+child_wide_filtered <- child_TC_avg |>
+  select(rFFA, lFFA, rMMPFC, lMMPFC)
+
+cor_child <- cor(child_wide_filtered, use = "pairwise.complete.obs")
+melted_child <- melt(cor_child)
+
+melted_child <- melted_child |>
+  mutate(
+    row_num = as.numeric(factor(Var1, levels = rownames(cor_child))),
+    col_num = as.numeric(factor(Var2, levels = colnames(cor_child)))
+  ) |>
+  filter(row_num >= col_num)  # keep only lower triangle + diagonal
+
+plot_child <- ggplot(melted_child, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 4) +
+  scale_fill_gradient2(low = "#1f78b4", mid = "white", high = "#e31a1c", midpoint = 0,
+                       limit = c(-1, 1), name = "Correlation") +
+  theme_minimal() +
+  labs(title = "Child") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme(
+  plot.title = element_text(hjust = 0.5),
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  axis.text.x = element_text(angle = 45, hjust = 1),  # show ROI names on x
+  axis.text.y = element_text()                         # show ROI names on y
+ )
+
+#Arrange plots side by side
+grid.arrange(plot_adult, plot_child, ncol = 2)
+```
+
+```{r Correlation heatmap - fMRI w/ sync}
+
+#sub-setting variables 
+vars <- full_data |>
+  select(synchrony, Fm_rFFA, Fm_lFFA, Fx_rFFA_rMMPFC, Fx_rFFA_lMMPFC, Fx_lFFA_rMMPFC, Fx_lFFA_lMMPFC)
+
+#Calculate correlation 
+cor_matrix <- cor(vars, use = "pairwise.complete.obs")
+
+#Melt correlation matrix to long format 
+melted_cor <- melt(cor_matrix) 
+
+melted_cor <- melt(cor_matrix) |> 
+  mutate(
+    row_num = as.numeric(factor(Var1, levels = rownames(cor_matrix))),
+    col_num = as.numeric(factor(Var2, levels = colnames(cor_matrix)))
+  ) |> 
+  filter(row_num >= col_num)  # keep lower triangle + diagonal only
+
+#Plot
+ggplot(data = melted_cor, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                       midpoint = 0, limit = c(-1, 1), space = "Lab",
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 8, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        plot.caption = element_text(hjust = 0, size = 8)) +  # left-align caption
+  coord_fixed() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text()
+  )
+```
+
+```{r Exploratory plots} 
+
+#synchrony normal distribution 
+ggplot(participant_data, aes(x = synchrony)) +
+  geom_density(fill = "#cce5ff", alpha = 0.6) +
+  stat_function(fun = dnorm, args = list(mean = sync_mean, sd = sync_sd)) +
+  labs(x = "Synchrony", y = "Density") +
+  theme_minimal()
+
+#sync vs 6 fMRI values 
+
+base_theme <- theme_bw(base_size = 8) + 
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5),
+  )
+
+color_points <- "#4B4B4B"   
+color_line <- "#1f78b4"     
+
+syncplot1 <- ggplot(full_data, aes(x = synchrony, y = Fm_rFFA)) +
+  geom_point(color = color_points, alpha = 0.5, size = 1) +
+  geom_smooth(method = "lm", se = TRUE, color = color_line, linewidth = 1) +
+  labs(x = "Synchrony", y = "Fm rFFA") +
+  base_theme
+
+syncplot2 <- ggplot(full_data, aes(x = synchrony, y = Fm_lFFA)) +
+  geom_point(color = color_points, alpha = 0.5, size = 1) +
+  geom_smooth(method = "lm", se = TRUE, color = color_line, linewidth = 1) +
+  labs(x = "Synchrony", y = "Fm lFFA") +
+  base_theme
+
+syncplot3 <- ggplot(full_data, aes(x = synchrony, y = Fx_rFFA_rMMPFC)) +
+  geom_point(color = color_points, alpha = 0.5, size = 1) +
+  geom_smooth(method = "lm", se = TRUE, color = color_line, linewidth = 1) +
+  labs(x = "Synchrony", y = "Fx rFFA-rMMPFC") +
+  base_theme
+
+syncplot4 <- ggplot(full_data, aes(x = synchrony, y = Fx_rFFA_lMMPFC)) +
+  geom_point(color = color_points, alpha = 0.5, size = 1) +
+  geom_smooth(method = "lm", se = TRUE, color = color_line, linewidth = 1) +
+  labs(x = "Synchrony", y = "Fx rFFA-lMMPFC") +
+  base_theme
+
+syncplot5 <- ggplot(full_data, aes(x = synchrony, y = Fx_lFFA_rMMPFC)) +
+  geom_point(color = color_points, alpha = 0.5, size = 1) +
+  geom_smooth(method = "lm", se = TRUE, color = color_line, linewidth = 1) +
+  labs(x = "Synchrony", y = "Fx lFFA-rMMPFC") +
+  base_theme
+
+syncplot6 <- ggplot(full_data, aes(x = synchrony, y = Fx_lFFA_lMMPFC)) +
+  geom_point(color = color_points, alpha = 0.5, size = 1) +
+  geom_smooth(method = "lm", se = TRUE, color = color_line, linewidth = 1) +
+  labs(x = "Synchrony", y = "Fx lFFA-lMMPFC") +
+  base_theme
+
+#Combine
+(syncplot1 + syncplot2 + syncplot3) / (syncplot4 + syncplot5 + syncplot6) +
+  plot_annotation(
+    #title = "Synchrony with fMRI Values",
+    theme = theme(
+      plot.title = element_text(size = 14, hjust = 0.5)
+    )
+  )
+
+#box-plots
+
+#Select only numeric variables (excluding ID and categorical variables)
+numeric_data <- wide_data |>
+  select(-Sub) |> 
+  select(where(is.numeric)) |>
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+#Plot boxplots for each variable
+ggplot(numeric_data, aes(x = Variable, y = Value, fill = Variable)) +
+  geom_boxplot(color = "black", outlier.color = "red") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0.8, size = 8),  
+    legend.position = "none"  
+  ) +
+  labs(
+    x = "Variables",
+    y = "Scaled Values"
+  )
+
+```
+
+```{r Master file}
+
+#Combine fm and fx data
+fm_fx_data <- fm_rFFA |>
+  full_join(fm_lFFA, by = "Sub") |>
+  full_join(fx_rFFA_rMMPFC, by = "Sub") |>
+  full_join(fx_rFFA_lMMPFC, by = "Sub") |>
+  full_join(fx_lFFA_rMMPFC, by = "Sub") |>
+  full_join(fx_lFFA_lMMPFC, by = "Sub")
+
+#Clean and rename keys to "Sub"
+demographics_clean <- demographics |>
+  rename(Sub = ID)
+
+motion_clean <- motion |>
+  filter(task == "pixar", run == "01") |>
+  mutate(Sub = str_remove(subject, "sub-") |> as.numeric()) |>  # Extract numeric ID
+  select(Sub, mean_FD = MeanFD)  # Rename to match rest of data
+
+#Merge 
+master_file <- fm_fx_data |>
+  full_join(demographics_clean, by = "Sub") |>
+  full_join(motion_clean, by = "Sub")
+
+# Create subset without NAs in FM and FX
+master_file_complete <- master_file |>
+  filter(
+    !is.na(Fm_rFFA),
+    !is.na(Fm_lFFA),
+    !is.na(Fx_rFFA_rMMPFC),
+    !is.na(Fx_rFFA_lMMPFC),
+    !is.na(Fx_lFFA_rMMPFC),
+    !is.na(Fx_lFFA_lMMPFC)
+  )
+
+#scaling 
+master_file_complete <- master_file_complete |> 
+  mutate(
+    GA = scale(GA)[, 1],
+    testing_age_days = scale(testing_age_days)[, 1],
+    mean_FD = scale(mean_FD)[, 1]
+  )
+```
+
+```{r post-hoc -  model without sync}
+
+#rFFA model without synchrony as predictor 
+model7_rFFA <- lm(
+  Fm_rFFA ~ Fx_rFFA_rMMPFC + Fx_rFFA_lMMPFC + GA + testing_age_days + mean_FD, 
+  data = master_file_complete)
+summary(model7_rFFA) #fx lmmpc is significant 
+
+#lFFA model without synchrony as predictor 
+model7_lFFA <- lm(
+  Fm_lFFA ~ Fx_lFFA_rMMPFC + Fx_lFFA_lMMPFC + GA + testing_age_days + mean_FD, 
+  data = master_file_complete)
+summary(model7_lFFA) #testing_age & mean_FD are significant 
+
+#note: variables are scaled 
+```
+
+```{r Correlation - fMRI}
+
+# Subset the relevant fMRI variables
+varsfmri <- fm_fx_data |>
+  select(Fm_rFFA, Fm_lFFA, Fx_rFFA_rMMPFC, Fx_rFFA_lMMPFC, Fx_lFFA_rMMPFC, Fx_lFFA_lMMPFC)
+
+# Calculate correlation matrix
+cor_matrix_fmri <- cor(varsfmri, use = "pairwise.complete.obs")
+
+melted_cor_fmri <- melt(cor_matrix_fmri)
+
+melted_cor_fmri <- melted_cor_fmri |>
+  mutate(
+    row_num = as.numeric(factor(Var1, levels = rownames(cor_matrix_fmri))),
+    col_num = as.numeric(factor(Var2, levels = colnames(cor_matrix_fmri)))
+  ) |>
+  filter(row_num >= col_num)  # keep lower triangle + diagonal only
+
+#Plot
+ggplot(data = melted_cor_fmri, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                       midpoint = 0, limit = c(-1, 1), space = "Lab",
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 8, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        plot.caption = element_text(hjust = 0, size = 8)) +  # left-align caption
+  coord_fixed() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text()
+  )
+
+```
+
+```{r post hoc - splitting the mdoels} 
+
+#rFFA model without synchrony as predictor 
+#model 1 with rMMPFC
+model8_rFFA1 <- lm(
+  Fm_rFFA ~ Fx_rFFA_rMMPFC + GA + testing_age_days + mean_FD, 
+  data = master_file_complete)
+summary(model8_rFFA1) #nothing is significant 
+
+#model 2 with lMMPFC
+model8_rFFA2 <- lm(
+  Fm_rFFA ~ Fx_rFFA_lMMPFC + GA + testing_age_days + mean_FD, 
+  data = master_file_complete)
+summary(model8_rFFA2) #nothing is significant (Fx is close .061)
+
+#lFFA model without synchrony as predictor 
+#model 1 with rMMPFC
+model8_lFFA1 <- lm(
+  Fm_lFFA ~ Fx_lFFA_rMMPFC + GA + testing_age_days + mean_FD, 
+  data = master_file_complete)
+summary(model8_lFFA1) #testing_age and mean_FD is significant 
+
+#model 2 with lMMPFC
+model8_lFFA2 <- lm(
+  Fm_lFFA ~ Fx_lFFA_lMMPFC + GA + testing_age_days + mean_FD, 
+  data = master_file_complete)
+summary(model8_lFFA2) #mean_FD is significant (testing_age is close .061)
+```
+
+```{r post hoc analysis - model assumptions vif}
+
+#checking for multicollinearity  
+vif(model8_rFFA1) 
+vif(model8_rFFA2) 
+vif(model8_lFFA1)
+vif(model8_lFFA2)
+#everything is less than 1.07
+```
+
+
+
